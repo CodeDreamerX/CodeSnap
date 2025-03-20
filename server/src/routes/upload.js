@@ -5,94 +5,77 @@ const fs = require('fs');
 const passport = require('passport');
 const Jimp = require('jimp');
 const Tesseract = require('tesseract.js');
-const { processImage, analyzeCodeForSecurity } = require('../utils/imageProcessing');
+const { processImage, saveImage } = require('../utils/imageProcessing');
+const { analyzeCodeForSecurity } = require('../utils/securityPatterns');
 
 const router = express.Router();
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, '../../uploads');
-    
-    // Create directory if it doesn't exist
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1E9)}`;
-    const ext = path.extname(file.originalname);
-    cb(null, `${file.fieldname}-${uniqueSuffix}${ext}`);
-  }
-});
 
-// File filter for image uploads
-const fileFilter = (req, file, cb) => {
-  // Accept only JPEG and PNG
-  if (file.mimetype === 'image/jpeg' || file.mimetype === 'image/png') {
-    cb(null, true);
-  } else {
-    cb(new Error('Only JPEG and PNG files are allowed'), false);
-  }
-};
-
-// Configure upload middleware
+// Configure multer for memory storage
 const upload = multer({
-  storage,
-  fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 5 * 1024 * 1024 // 5MB limit
+    },
+    fileFilter: (req, file, cb) => {
+        // Accept only image files
+        if (file.mimetype.startsWith('image/')) {
+            cb(null, true);
+        } else {
+            console.error('Invalid file type:', file.mimetype);
+            cb(new Error('Only image files are allowed'));
+        }
+    }
 });
 
 // Auth middleware
 const auth = passport.authenticate('jwt', { session: false });
 
-// Route for file upload
-router.post('/file', auth, upload.single('screenshot'), async (req, res) => {
-  try {
-    // Check if file exists
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded' });
+// Handle image upload and processing
+router.post('/', upload.single('image'), async (req, res) => {
+    try {
+        console.log('Upload request received:', {
+            hasFile: !!req.file,
+            fileType: req.file?.mimetype,
+            fileSize: req.file?.size,
+            fileName: req.file?.originalname
+        });
+
+        if (!req.file) {
+            console.error('No file in request');
+            return res.status(400).json({ error: 'No image file provided' });
+        }
+
+        // Save the uploaded image
+        const imagePath = await saveImage(req.file);
+        console.log('Image saved to:', imagePath);
+
+        // Process the image to extract code
+        const { text: extractedCode, confidence } = await processImage(req.file.buffer);
+        console.log('Code extracted with confidence:', confidence);
+
+        // Analyze the code for security issues
+        const securityAnalysis = await analyzeCodeForSecurity(extractedCode);
+        console.log('Security analysis completed');
+
+        res.json({
+            success: true,
+            code: extractedCode,
+            confidence: Math.round(confidence),
+            securityAnalysis,
+            imagePath
+        });
+    } catch (error) {
+        console.error('Upload error details:', {
+            message: error.message,
+            stack: error.stack,
+            name: error.name
+        });
+        res.status(500).json({
+            error: 'Error processing image',
+            details: error.message
+        });
     }
-    
-    // Get file path
-    const filePath = req.file.path;
-    
-    // Process image to extract text
-    const { text, confidence } = await processImage(filePath);
-    
-    // Analyze code for security issues
-    const securityResults = analyzeCodeForSecurity(text);
-    
-    // Calculate ScanFactor
-    const scanFactor = Math.round(confidence);
-    
-    // Create response
-    const response = {
-      scanFactor,
-      issues: securityResults.issues,
-      issuesFound: securityResults.issues.length > 0
-    };
-    
-    // Delete the uploaded file
-    fs.unlinkSync(filePath);
-    
-    res.json(response);
-  } catch (error) {
-    console.error('Upload processing error:', error);
-    
-    // Delete the uploaded file if it exists
-    if (req.file && req.file.path) {
-      try {
-        fs.unlinkSync(req.file.path);
-      } catch (unlinkError) {
-        console.error('Error deleting file:', unlinkError);
-      }
-    }
-    
-    res.status(500).json({ message: 'Error processing image', error: error.message });
-  }
 });
 
 // Route for paste upload (base64 image data)
@@ -105,42 +88,24 @@ router.post('/paste', auth, async (req, res) => {
       return res.status(400).json({ message: 'Invalid image data' });
     }
     
-    // Create temp directory if it doesn't exist
-    const uploadDir = path.join(__dirname, '../../uploads');
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    
-    // Create temp file path
-    const filePath = path.join(uploadDir, `paste-${Date.now()}.png`);
-    
     // Extract base64 data
     const base64Data = imageData.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
     
-    // Write buffer to file
-    fs.writeFileSync(filePath, buffer);
-    
-    // Process image to extract text
-    const { text, confidence } = await processImage(filePath);
+    // Process image to extract text directly from buffer
+    const { text: extractedCode, confidence } = await processImage(buffer);
+    console.log('Code extracted with confidence:', confidence);
     
     // Analyze code for security issues
-    const securityResults = analyzeCodeForSecurity(text);
+    const securityAnalysis = await analyzeCodeForSecurity(extractedCode);
+    console.log('Security analysis completed');
     
-    // Calculate ScanFactor
-    const scanFactor = Math.round(confidence);
-    
-    // Create response
-    const response = {
-      scanFactor,
-      issues: securityResults.issues,
-      issuesFound: securityResults.issues.length > 0
-    };
-    
-    // Delete the temp file
-    fs.unlinkSync(filePath);
-    
-    res.json(response);
+    res.json({
+      success: true,
+      code: extractedCode,
+      confidence: Math.round(confidence),
+      securityAnalysis
+    });
   } catch (error) {
     console.error('Paste processing error:', error);
     res.status(500).json({ message: 'Error processing image', error: error.message });

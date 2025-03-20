@@ -48,10 +48,10 @@ const DashboardPage = () => {
     setError(null);
     
     const formData = new FormData();
-    formData.append('screenshot', file);
+    formData.append('image', file);
 
     try {
-      const response = await axios.post('/api/upload/file', formData, {
+      const response = await axios.post('/api/upload', formData, {
         headers: {
           'Content-Type': 'multipart/form-data'
         }

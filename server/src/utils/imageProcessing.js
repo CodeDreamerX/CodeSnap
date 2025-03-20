@@ -1,246 +1,221 @@
-const fs = require('fs');
-const Jimp = require('jimp');
-const path = require('path');
+const sharp = require('sharp');
 const { createWorker } = require('tesseract.js');
+const path = require('path');
+const fs = require('fs');
+const fsPromises = require('fs').promises;
+
+/**
+ * Save debug file with timestamp
+ * @param {string} prefix - File prefix
+ * @param {string} ext - File extension
+ * @returns {string} - Debug file path
+ */
+async function getDebugFilePath(prefix, ext) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const debugDir = path.join(__dirname, '../../debug');
+    if (!fs.existsSync(debugDir)) {
+        fs.mkdirSync(debugDir, { recursive: true });
+    }
+    return path.join(debugDir, `${prefix}_${timestamp}.${ext}`);
+}
 
 /**
  * Preprocesses an image to optimize it for OCR
- * @param {string} inputPath - Path to the input image
- * @returns {Promise<string>} - Path to the preprocessed image
+ * @param {Buffer} imageBuffer - The image buffer
+ * @returns {Promise<Buffer>} - The preprocessed image buffer
  */
-const preprocessImage = async (inputPath) => {
-  try {
-    // Read the image
-    const image = await Jimp.read(inputPath);
-    
-    // Convert to grayscale for better OCR
-    image.grayscale();
-    
-    // Create a processed filename
-    const processedPath = `${inputPath}-processed.png`;
-    
-    // Find the dominant background color
-    const colorMap = {};
-    
-    // Sample corners to determine the most common color (likely background)
-    const width = image.getWidth();
-    const height = image.getHeight();
-    
-    // Sample various points at the edges to find common background color
-    const samplePoints = [
-      { x: 0, y: 0 },
-      { x: width - 1, y: 0 },
-      { x: 0, y: height - 1 },
-      { x: width - 1, y: height - 1 },
-      { x: Math.floor(width / 2), y: 0 },
-      { x: 0, y: Math.floor(height / 2) },
-      { x: width - 1, y: Math.floor(height / 2) },
-      { x: Math.floor(width / 2), y: height - 1 }
-    ];
-    
-    // Get colors from sample points
-    for (const point of samplePoints) {
-      const color = image.getPixelColor(point.x, point.y);
-      const hex = Jimp.intToRGBA(color);
-      const key = `${hex.r},${hex.g},${hex.b}`;
-      if (!colorMap[key]) {
-        colorMap[key] = 0;
-      }
-      colorMap[key]++;
+async function preprocessImage(imageBuffer) {
+    try {
+        console.log('Starting image preprocessing...');
+        
+        // Get image metadata first
+        const metadata = await sharp(imageBuffer).metadata();
+        console.log('Original image dimensions:', metadata.width, 'x', metadata.height);
+        
+        // Initial grayscale conversion and resize
+        let grayscale = await sharp(imageBuffer)
+            .grayscale()
+            .resize({ 
+                width: 2048, 
+                height: 2048, 
+                fit: 'inside', 
+                withoutEnlargement: false 
+            })
+            .toBuffer();
+
+        // Save original grayscale for debugging
+        const grayscalePath = await getDebugFilePath('01_grayscale', 'png');
+        await sharp(grayscale).toFile(grayscalePath);
+        console.log('Saved grayscale image:', grayscalePath);
+
+        // Check if it's a dark theme
+        const stats = await sharp(grayscale).stats();
+        const isDarkBackground = stats.channels[0].mean < 128;
+        console.log('Image stats:', {
+            mean: stats.channels[0].mean,
+            isDarkBackground
+        });
+
+        let processed;
+        if (isDarkBackground) {
+            // For dark themes:
+            // 1. Invert first
+            // 2. Normalize with wider range to preserve highlights
+            // 3. Apply very gentle contrast to maintain highlight differences
+            processed = await sharp(grayscale)
+                .negate()
+                .normalize({ lower: 5, upper: 95 }) // Wider normalization range to preserve highlights
+                .linear(1.1, 0) // Very gentle contrast, no offset
+                .toBuffer();
+            
+            // Save inverted image for debugging
+            const invertedPath = await getDebugFilePath('02_inverted', 'png');
+            await sharp(processed).toFile(invertedPath);
+            console.log('Saved inverted image:', invertedPath);
+        } else {
+            // For light themes:
+            // 1. Normalize with wider range
+            // 2. Apply gentle contrast
+            processed = await sharp(grayscale)
+                .normalize({ lower: 5, upper: 95 }) // Wider normalization range
+                .linear(1.2, 0) // Gentle contrast, no offset
+                .toBuffer();
+        }
+
+        // Final enhancement with gentler sharpening
+        const enhanced = await sharp(processed)
+            .sharpen({
+                sigma: isDarkBackground ? 0.8 : 0.6,  // Even softer sharpening
+                m1: 0.2,  // Very gentle sharpening
+                m2: 0.3,  // Reduced edge enhancement
+                x1: 2,
+                y2: 8,
+                y3: 10
+            })
+            .toBuffer();
+
+        // Save final preprocessed image for debugging
+        const enhancedPath = await getDebugFilePath('03_enhanced', 'png');
+        await sharp(enhanced).toFile(enhancedPath);
+        console.log('Saved enhanced image:', enhancedPath);
+
+        return enhanced;
+    } catch (error) {
+        console.error('Error in image preprocessing:', error);
+        throw error;
     }
-    
-    // Find the most common color
-    let maxCount = 0;
-    let mostCommonColor = null;
-    
-    for (const [color, count] of Object.entries(colorMap)) {
-      if (count > maxCount) {
-        maxCount = count;
-        mostCommonColor = color;
-      }
-    }
-    
-    // Convert to array of RGB values
-    const [r, g, b] = mostCommonColor.split(',').map(Number);
-    
-    // Process the image with color segmentation
-    image.scan(0, 0, width, height, function(x, y, idx) {
-      const pixelColor = Jimp.intToRGBA(this.getPixelColor(x, y));
-      
-      // Calculate color distance from background
-      const dr = pixelColor.r - r;
-      const dg = pixelColor.g - g;
-      const db = pixelColor.b - b;
-      const distance = Math.sqrt(dr * dr + dg * dg + db * db);
-      
-      // If color is different from background by a threshold, make it black, otherwise white
-      if (distance > 50) {
-        this.setPixelColor(Jimp.rgbaToInt(0, 0, 0, 255), x, y); // Black
-      } else {
-        this.setPixelColor(Jimp.rgbaToInt(255, 255, 255, 255), x, y); // White
-      }
-    });
-    
-    // Increase contrast
-    image.contrast(0.5);
-    
-    // Save processed image
-    await image.writeAsync(processedPath);
-    
-    return processedPath;
-  } catch (error) {
-    console.error('Image preprocessing error:', error);
-    throw error;
-  }
-};
+}
+
+/**
+ * Post-processes OCR output to clean it up
+ * @param {string} text - The OCR output text
+ * @returns {string} - The cleaned up text
+ */
+function postProcessText(text) {
+    return text
+        // Normalize whitespace
+        .replace(/\s+/g, ' ')
+        // Preserve indentation
+        .replace(/^\s+/gm, match => match.replace(/ /g, '\t'))
+        // Trim leading/trailing whitespace
+        .trim();
+}
 
 /**
  * Process an image to extract text using OCR
- * @param {string} imagePath - Path to the image file
- * @returns {Promise<{text: string, confidence: number}>} - Extracted text and confidence
+ * @param {Buffer} imageBuffer - The image buffer
+ * @returns {Promise<{text: string, confidence: number}>} - The extracted text and confidence score
  */
-const processImage = async (imagePath) => {
-  try {
-    // Preprocess the image
-    const processedImagePath = await preprocessImage(imagePath);
-    
-    // Create a worker
-    const worker = await createWorker();
-    
-    // Load language and set parameters
-    await worker.loadLanguage('eng');
-    await worker.initialize('eng');
-    
-    // Set OCR parameters optimized for code
-    await worker.setParameters({
-      tessedit_pageseg_mode: '6', // Assume a single uniform block of text
-      load_system_dawg: '0', // Disable dictionary to avoid "fixing" code terms
-      load_freq_dawg: '0', // Disable frequency-based corrections
-    });
-    
-    // Recognize text
-    const { data } = await worker.recognize(processedImagePath);
-    
-    // Clean up processed image
-    fs.unlinkSync(processedImagePath);
-    
-    // Terminate worker
-    await worker.terminate();
-    
-    return {
-      text: data.text,
-      confidence: data.confidence
-    };
-  } catch (error) {
-    console.error('OCR processing error:', error);
-    throw error;
-  }
-};
+async function processImage(imageBuffer) {
+    let worker = null;
+    try {
+        console.log('Starting OCR processing...');
+        
+        // Preprocess the image
+        const preprocessedBuffer = await preprocessImage(imageBuffer);
+
+        // Create and initialize Tesseract worker
+        worker = await createWorker('eng');
+        console.log('Tesseract worker initialized');
+
+        // Configure worker for code recognition
+        await worker.setParameters({
+            tessedit_pageseg_mode: '6', // Assume uniform block of text
+            tessedit_char_whitelist: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789{}[]()=+-*/<>!&|%#.,;:_/',
+            tessedit_ocr_engine_mode: '2', // Use neural nets mode
+            textord_heavy_nr: '0', // Disable heavy noise removal to preserve details
+            textord_min_linesize: '1.5', // Lower minimum text size to catch all characters
+            tessedit_write_images: '0',
+            tessedit_write_params_to_file: '0',
+            textord_force_make_prop_words: '1', // Force proportional word spacing
+            textord_heavy_nr: '0', // Disable heavy noise removal to preserve comments
+            textord_min_linesize: '1.5', // Lower minimum text size to catch comments
+            tessedit_do_invert: '1', // Enable automatic inversion
+            tessedit_ocr_engine_mode: '3' // Use LSTM mode for better accuracy
+        });
+        console.log('Tesseract parameters configured');
+
+        // Perform OCR
+        console.log('Starting text recognition...');
+        const { data } = await worker.recognize(preprocessedBuffer);
+        console.log('Raw OCR data:', {
+            confidence: data.confidence,
+            textLength: data.text.length,
+            words: data.words?.length || 0
+        });
+
+        // Save raw text for debugging
+        const rawTextPath = await getDebugFilePath('raw_text', 'txt');
+        await fsPromises.writeFile(rawTextPath, data.text);
+        console.log('Saved raw text:', rawTextPath);
+
+        // Post-process the text
+        const processedText = postProcessText(data.text);
+
+        // Save processed text for debugging
+        const processedTextPath = await getDebugFilePath('processed_text', 'txt');
+        await fsPromises.writeFile(processedTextPath, processedText);
+        console.log('Saved processed text:', processedTextPath);
+
+        return {
+            text: processedText,
+            confidence: data.confidence || 0
+        };
+    } catch (error) {
+        console.error('Error in OCR processing:', error);
+        throw error;
+    } finally {
+        if (worker) {
+            await worker.terminate();
+            console.log('Tesseract worker terminated');
+        }
+    }
+}
 
 /**
- * Analyze code for security risks
- * @param {string} code - The code text to analyze
- * @returns {Object} - Analysis results
+ * Function to save uploaded image
+ * @param {Object} file - The uploaded file object
+ * @returns {Promise<string>} - The path to the saved image
  */
-const analyzeCodeForSecurity = (code) => {
-  const issues = [];
-  
-  // Check for AWS credentials
-  const awsKeyRegex = /AKIA[0-9A-Z]{16}/g;
-  const awsSecretRegex = /[0-9a-zA-Z/+]{40}/g;
-  
-  // Check for API keys and tokens with common patterns
-  const apiKeyRegex = /['"`](api[-_]?key|api[-_]?token|app[-_]?key|app[-_]?token|auth[-_]?token|access[-_]?token|secret[-_]?key)['"`]\s*[:=]\s*['"`][0-9a-zA-Z_\-]{20,}['"`]/gi;
-  
-  // Check for password assignments
-  const passwordRegex = /['"`](password|passwd|pwd|secret)['"`]\s*[:=]\s*['"`][^'"`]+['"`]/gi;
-  
-  // Check for database connection strings
-  const dbConnRegex = /(mongodb|mysql|postgresql|postgres):\/\/[^:]+:[^@]+@[^/]+/gi;
-  
-  // Check for IP addresses
-  const ipRegex = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
-  
-  // Check for email addresses
-  const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
-  
-  // AWS Keys
-  const awsKeys = code.match(awsKeyRegex);
-  if (awsKeys) {
-    issues.push({
-      type: 'AWS Access Key',
-      description: 'Found potential AWS Access Key ID',
-      severity: 'High'
-    });
-  }
-  
-  // AWS Secrets
-  const awsSecrets = code.match(awsSecretRegex);
-  if (awsSecrets && awsKeys) { // Only flag if we also found an AWS key
-    issues.push({
-      type: 'AWS Secret Key',
-      description: 'Found potential AWS Secret Access Key',
-      severity: 'High'
-    });
-  }
-  
-  // API Keys
-  const apiKeys = code.match(apiKeyRegex);
-  if (apiKeys) {
-    issues.push({
-      type: 'API Key/Token',
-      description: 'Found potential API key or token',
-      severity: 'High'
-    });
-  }
-  
-  // Passwords
-  const passwords = code.match(passwordRegex);
-  if (passwords) {
-    issues.push({
-      type: 'Password',
-      description: 'Found hardcoded password or secret',
-      severity: 'High'
-    });
-  }
-  
-  // Database connection strings
-  const dbConnections = code.match(dbConnRegex);
-  if (dbConnections) {
-    issues.push({
-      type: 'Database Credentials',
-      description: 'Found database connection string with credentials',
-      severity: 'High'
-    });
-  }
-  
-  // IP addresses
-  const ips = code.match(ipRegex);
-  if (ips) {
-    issues.push({
-      type: 'IP Address',
-      description: 'Found hardcoded IP address',
-      severity: 'Medium'
-    });
-  }
-  
-  // Email addresses
-  const emails = code.match(emailRegex);
-  if (emails) {
-    issues.push({
-      type: 'Email Address',
-      description: 'Found email address',
-      severity: 'Low'
-    });
-  }
-  
-  return {
-    issues,
-    issuesFound: issues.length > 0
-  };
-};
+async function saveImage(file) {
+    try {
+        const uploadDir = path.join(__dirname, '../../uploads');
+        if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+        }
+
+        const fileName = `${Date.now()}-${file.originalname}`;
+        const filePath = path.join(uploadDir, fileName);
+
+        await fsPromises.writeFile(filePath, file.buffer);
+        return filePath;
+    } catch (error) {
+        console.error('Error saving image:', error);
+        throw error;
+    }
+}
 
 module.exports = {
   processImage,
-  analyzeCodeForSecurity
+  saveImage
 }; 
