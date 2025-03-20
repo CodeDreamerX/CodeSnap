@@ -105,9 +105,7 @@ const processImage = async (imagePath) => {
     const processedImagePath = await preprocessImage(imagePath);
     
     // Create a worker
-    const worker = await createWorker({
-      langPath: path.join(__dirname, '../..', 'tessdata'), // Use local tessdata if available
-    });
+    const worker = await createWorker();
     
     // Load language and set parameters
     await worker.loadLanguage('eng');
